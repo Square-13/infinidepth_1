@@ -1,0 +1,4 @@
+checkpoints/depth/*.ckpt filter=lfs diff=lfs merge=lfs -text
+checkpoints/gs/*.ckpt filter=lfs diff=lfs merge=lfs -text
+checkpoints/moge-2-vitl-normal/model.pt filter=lfs diff=lfs merge=lfs -text
+checkpoints/sky/skyseg.onnx filter=lfs diff=lfs merge=lfs -text
