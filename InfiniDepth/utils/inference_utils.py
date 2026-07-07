@@ -281,6 +281,21 @@ def run_optional_sampling_sky_mask(
             sky_mask_np = run_skyseg(sky_model, input_size=(320, 320), image=image[bi : bi + 1])
             sky_mask_np = cv2.resize(sky_mask_np, (w, h), interpolation=cv2.INTER_NEAREST)
             sky_mask_np = (sky_mask_np > 127).astype("uint8")
+
+            # Protect thin non-sky structures on sky background, e.g. cranes.
+            img_np = image[bi].detach().float().cpu().permute(1, 2, 0).numpy()
+            gray = 0.299 * img_np[..., 0] + 0.587 * img_np[..., 1] + 0.114 * img_np[..., 2]
+            mx = img_np.max(axis=2)
+            mn = img_np.min(axis=2)
+            sat = (mx - mn) / (mx + 1e-6)
+            gx = np.zeros_like(gray)
+            gy = np.zeros_like(gray)
+            gx[:, 1:] = np.abs(gray[:, 1:] - gray[:, :-1])
+            gy[1:, :] = np.abs(gray[1:, :] - gray[:-1, :])
+            edge = gx + gy
+            detail_rescue = (edge > np.percentile(edge, 98.5)) & (sat > 0.055)
+            sky_mask_np[detail_rescue] = 0
+
             if kernel is not None:
                 sky_mask_np = cv2.dilate(sky_mask_np, kernel, iterations=1)
         except Exception as exc:

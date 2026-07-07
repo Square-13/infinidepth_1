@@ -240,6 +240,8 @@ def _build_sparse_uniform_gaussians(
     extrinsics: torch.Tensor,
     h: int,
     w: int,
+    far_scale_min_depth: float = 80.0,
+    far_scale_multiplier: float = 1.0,
 ) -> Gaussians:
     """Convert dense pixel gaussians to sparse 3d-uniform gaussians.
     """
@@ -284,6 +286,68 @@ def _build_sparse_uniform_gaussians(
     sparse_scales = sample_attribute(dense_gaussians.scales)
     sparse_rotations = sample_attribute(dense_gaussians.rotations)
     sparse_rotations = sparse_rotations / (torch.norm(sparse_rotations, dim=-1, keepdim=True) + 1e-8)
+
+    # ---------- Soft scale clamp ----------
+    # Conservative version: do not delete points and do not reduce opacity.
+    # Only clamp oversized Gaussians, especially near strong depth discontinuities.
+    try:
+        dense_z = dense_gaussians.means[0, :, 2].reshape(h, w).float()
+        dzx = torch.zeros_like(dense_z)
+        dzy = torch.zeros_like(dense_z)
+        dzx[:, 1:] = torch.abs(dense_z[:, 1:] - dense_z[:, :-1])
+        dzy[1:, :] = torch.abs(dense_z[1:, :] - dense_z[:-1, :])
+
+        min_x = torch.minimum(dense_z[:, 1:], dense_z[:, :-1]).clamp(min=1.0)
+        min_y = torch.minimum(dense_z[1:, :], dense_z[:-1, :]).clamp(min=1.0)
+
+        rel = torch.zeros_like(dense_z)
+        rel[:, 1:] = torch.maximum(rel[:, 1:], dzx[:, 1:] / min_x)
+        rel[:, :-1] = torch.maximum(rel[:, :-1], dzx[:, 1:] / min_x)
+        rel[1:, :] = torch.maximum(rel[1:, :], dzy[1:, :] / min_y)
+        rel[:-1, :] = torch.maximum(rel[:-1, :], dzy[1:, :] / min_y)
+
+        span = torch.maximum(dzx, dzy)
+
+        risk_hw = (dense_z >= 25.0) & ((rel >= 0.06) | (span >= 6.0))
+        risk_float = risk_hw.float()[None, None]
+        risk_float = F.max_pool2d(risk_float, kernel_size=1, stride=1, padding=0)
+        risk_sample = F.grid_sample(risk_float, grid, mode="bilinear", align_corners=False).squeeze()
+
+        scales0 = sparse_scales[0]
+        scale_norm = torch.norm(scales0, dim=-1)
+
+        global_cap = torch.quantile(scale_norm, 0.985)
+        global_factor = torch.clamp(global_cap / torch.clamp(scale_norm, min=1e-8), max=1.0)
+        scales0 = scales0 * global_factor.unsqueeze(-1)
+
+        risk = risk_sample > 0.95
+        if risk.any():
+            risk_norm = torch.norm(scales0, dim=-1)
+            risk_cap = torch.quantile(risk_norm, 0.90)
+            large_risk = risk & (risk_norm > risk_cap)
+            if large_risk.any():
+                risk_factor = torch.clamp(risk_cap / torch.clamp(risk_norm, min=1e-8), max=1.0)
+                scales0[large_risk] = scales0[large_risk] * risk_factor[large_risk].unsqueeze(-1)
+            print(
+                f"[Info] soft-scale clamp: risk={int(risk.sum())}, "
+                f"large_risk={int(large_risk.sum()) if 'large_risk' in locals() else 0}, "
+                f"global_cap={float(global_cap):.6f}"
+            )
+        else:
+            print(f"[Info] soft-scale clamp: risk=0, global_cap={float(global_cap):.6f}")
+
+        sparse_scales = scales0.unsqueeze(0)
+    except Exception as exc:
+        print(f"[WARNING] soft-scale clamp skipped: {type(exc).__name__}: {exc}")
+
+    if 0.0 < far_scale_multiplier < 1.0:
+        far_scale_mask = depth_values >= far_scale_min_depth
+        if far_scale_mask.any():
+            sparse_scales[:, far_scale_mask, :] = sparse_scales[:, far_scale_mask, :] * far_scale_multiplier
+            print(
+                f"[Info] far-scale shrink: points={int(far_scale_mask.sum())}, "
+                f"min_depth={float(far_scale_min_depth):.2f}, multiplier={float(far_scale_multiplier):.3f}"
+            )
 
     return Gaussians(
         means=sparse_pts_world.unsqueeze(0),
