@@ -301,7 +301,7 @@ class _BaseInfiniDepthModel(nn.Module):
         sky_mask: Optional[torch.Tensor] = None,
         sample_point_num: int = 200000,
         coord_deterministic_sampling: bool = True,
-        gs_max_sample_depth: Optional[float] = None,
+        gs_max_sample_depth: Optional[float] = 220.0,
         gs_sample_filter_mode: str = "max_depth",
         gs_far_detail_min_depth: float = 45.0,
         gs_far_detail_edge_quantile: float = 0.65,

@@ -206,25 +206,3 @@ pred_normal
 pred_pcd
 checkpoints
 common_space
-
-# GitHub-ready final fork: keep generated artifacts and large local files out of git.
-checkpoints/
-outputs/
-output/
-analysis_outputs/
-diag*/
-tmp/
-temp/
-*.log
-*.ply
-*.mp4
-*.avi
-*.mov
-*.mkv
-*.ckpt
-*.pt
-*.pth
-*.onnx
-*.bin
-assets/demo.gif
-assets/supersplat-viewer/index.js.map

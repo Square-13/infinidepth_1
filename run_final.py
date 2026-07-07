@@ -108,7 +108,7 @@ PROFILE_ENVS: Dict[str, Dict[str, str]] = {
 @dataclass
 class Paths:
     repo: Path
-    venv: Optional[Path]
+    venv: Path
     tmp_root: Path
     nice: Path
     self_out: Path
@@ -143,21 +143,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Configuration profile. `smart` auto-selects; `final` is for mount/vally; `auto` matches AUTO_SCENE=1 shell behavior.",
     )
-    parser.add_argument(
-        "--tmp-root",
-        default=os.environ.get("INFINIDEPTH_TMP_ROOT", "/tmp/infinidepth"),
-        help="Directory for intermediate outputs and downloaded checkpoints.",
-    )
-    parser.add_argument(
-        "--venv",
-        default=os.environ.get("INFINIDEPTH_VENV", ""),
-        help="Optional virtualenv path. If omitted, the current Python environment is used.",
-    )
-    parser.add_argument("--depth-ckpt", default=os.environ.get("INFINIDEPTH_DEPTH_CKPT"))
-    parser.add_argument("--moge-ckpt", default=os.environ.get("INFINIDEPTH_MOGE_CKPT"))
-    parser.add_argument("--depthsensor-ckpt", default=os.environ.get("INFINIDEPTH_DEPTHSENSOR_CKPT"))
-    parser.add_argument("--depthsensor-gs-ckpt", default=os.environ.get("INFINIDEPTH_DEPTHSENSOR_GS_CKPT"))
-    parser.add_argument("--sky-ckpt", default=os.environ.get("INFINIDEPTH_SKY_CKPT"))
+    parser.add_argument("--tmp-root", default="/tmp/infinidepth")
+    parser.add_argument("--venv", default="/tmp/infinidepth/venv")
     parser.add_argument("--far-cap", default=None)
     parser.add_argument("--far-min", default=None)
     parser.add_argument("--nice-cap", default=None)
@@ -170,7 +157,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-render-video", dest="render_video", action="store_false")
     parser.add_argument(
         "--download-host",
-        default=os.environ.get("INFINIDEPTH_DOWNLOAD_HOST", "server"),
+        default="server",
         help="SSH host name used when printing Windows PowerShell scp download commands.",
     )
     parser.add_argument(
@@ -255,7 +242,7 @@ def resolve_paths(args: argparse.Namespace, name: str) -> Paths:
         repo = Path(__file__).resolve().parent
 
     tmp_root = Path(args.tmp_root)
-    venv = Path(args.venv) if args.venv else None
+    venv = Path(args.venv)
     nice = repo / "code_snapshots" / "nice_latest"
     if not nice.is_dir():
         nice = tmp_root / "code_snapshots" / "nice_latest"
@@ -263,7 +250,7 @@ def resolve_paths(args: argparse.Namespace, name: str) -> Paths:
     self_out = tmp_root / "outputs" / f"self_prompt_{name}_nice_prompt_compress"
     gs_out = tmp_root / "outputs" / f"gs_{name}_nice_prompt_compress"
     trace_out = self_out / "trace_stage2"
-    python_exe = venv / "bin" / "python3" if venv is not None else Path(sys.executable).resolve()
+    python_exe = venv / "bin" / "python3"
 
     return Paths(
         repo=repo,
@@ -273,23 +260,17 @@ def resolve_paths(args: argparse.Namespace, name: str) -> Paths:
         self_out=self_out,
         gs_out=gs_out,
         trace_out=trace_out,
-        depth_ckpt=Path(args.depth_ckpt) if args.depth_ckpt else tmp_root / "checkpoints" / "infinidepth.ckpt",
-        moge_ckpt=Path(args.moge_ckpt) if args.moge_ckpt else tmp_root / "checkpoints" / "moge" / "model.pt",
-        depthsensor_ckpt=Path(args.depthsensor_ckpt)
-        if args.depthsensor_ckpt
-        else repo / "checkpoints" / "depth" / "infinidepth_depthsensor.ckpt",
-        depthsensor_gs_ckpt=Path(args.depthsensor_gs_ckpt)
-        if args.depthsensor_gs_ckpt
-        else repo / "checkpoints" / "gs" / "infinidepth_depthsensor_gs.ckpt",
-        sky_ckpt=Path(args.sky_ckpt) if args.sky_ckpt else repo / "checkpoints" / "sky" / "skyseg.onnx",
+        depth_ckpt=tmp_root / "checkpoints" / "infinidepth.ckpt",
+        moge_ckpt=tmp_root / "checkpoints" / "moge" / "model.pt",
+        depthsensor_ckpt=repo / "checkpoints" / "depth" / "infinidepth_depthsensor.ckpt",
+        depthsensor_gs_ckpt=repo / "checkpoints" / "gs" / "infinidepth_depthsensor_gs.ckpt",
+        sky_ckpt=repo / "checkpoints" / "sky" / "skyseg.onnx",
         python_exe=python_exe,
     )
 
 
 def maybe_reexec_in_venv(args: argparse.Namespace, paths: Paths) -> None:
     if args.dry_run:
-        return
-    if paths.venv is None:
         return
     if not paths.python_exe.exists():
         raise SystemExit(f"ERROR: venv python not found: {paths.python_exe}")
