@@ -1,644 +1,295 @@
-<div align="center">
+# InfiniDepth Far-Depth Final Version
 
-<h1>
-  <img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Objects/Telescope.png" alt="Telescope" width="40" height="40" />
-  InfiniDepth: Arbitrary-Resolution and Fine-Grained Depth Estimation with Neural Implicit Fields
-</h1>
+这是一个基于官方 InfiniDepth 修改的远景适配版本。目标不是重新训练模型，而是在推理阶段让近景和远景都能参与深度估计与 3D Gaussian Splatting 生成，解决原始流程在山体、远处建筑、远景背景中容易出现的“纸板感”和远景缺点问题。
 
-<div align="center">
-  <a href="https://zju3dv.github.io/InfiniDepth/">
-    <img src="https://img.shields.io/badge/Project-Page-red?logo=googlechrome&logoColor=red">
-  </a>
-  <a href="https://arxiv.org/abs/2601.03252">
-    <img src="https://img.shields.io/badge/arXiv-Paper-blue?logo=arxiv&logoColor=blue">
-  </a>
-  <a href="https://huggingface.co/spaces/ritianyu/InfiniDepth">
-    <img src="https://img.shields.io/badge/HuggingFace-Demo-yellow?logo=huggingface&logoColor=yellow">
-  </a>
-  <a href="https://huggingface.co/datasets/ritianyu/game_4k_data">
-    <img src="https://img.shields.io/badge/HuggingFace-Dataset-orange?logo=huggingface&logoColor=orange">
-  </a>
-  <a href="assets/wechat.jpg">
-    <img src="https://img.shields.io/badge/微信-WeChat-green?logo=wechat&logoColor=green">
-  </a>
-</div>
-  
-<p align="center">
-  <a href="https://ritianyu.github.io/">Hao Yu*</a> •
-  <a href="https://haotongl.github.io/">Haotong Lin*</a> •
-  <a href="https://github.com/PLUS-WAVE">Jiawei Wang*</a> •
-  <a href="https://github.com/Dustbin-Li">Jiaxin Li</a> •
-  <a href="https://wangyida.github.io/">Yida Wang</a> •
-  <a href="#">Xueyang Zhang</a> •
-  <a href="https://ywang-zju.github.io/">Yue Wang</a> <br>
-  <a href="https://www.xzhou.me/">Xiaowei Zhou</a> •
-  <a href="https://csse.szu.edu.cn/staff/ruizhenhu/">Ruizhen Hu</a> •
-  <a href="https://pengsida.net/">Sida Peng</a>
-</p>
+官方项目地址：
 
-</div>
+- InfiniDepth: https://github.com/zju3dv/InfiniDepth
+- Project page: https://zju3dv.github.io/InfiniDepth/
+- Paper: https://arxiv.org/abs/2601.03252
 
-<div align="center">
+本仓库保留官方目录结构和大部分源码，只在推理流程、远景采样、深度上限和 GS 点生成策略上做修改。权重文件不随 GitHub 上传，需要单独下载后放入对应目录。
 
-<img src="assets/demo.gif" alt="InfiniDepth Demo" width="90%" />
+## 这个版本解决什么问题
 
-</div>
+官方 InfiniDepth 的推理流程对普通场景效果很好，但在非常远的场景里会遇到两个问题：
 
-## 📢 News
-> **[2026-04]** 🎉 Training and evaluation code of InfiniDepth (RGB Only & Depth Sensor Augmentation) is available now!
+1. 深度估计阶段默认有效距离偏短，极远区域可能被压到上限附近。
+2. GS 点生成阶段的 sparse prompt 和 mesh/sample pruning 更偏向近中景，远处点数不足时会像一张有起伏的纸板。
 
-> **[2026-03]** 🎉 Inference code of InfiniDepth (RGB Only & Depth Sensor Augmentation) is available now!
+本版本的核心思想是把“深度补全”和“GS 点生成”分开处理：
 
-> **[2026-02]** 🎉 InfiniDepth has been accepted to CVPR 2026! Code coming soon!
+1. 第一遍先做 dense depth，也就是完整的稠密深度估计。
+2. 根据场景自动或手动设置远景上限，例如 200、500、2000。
+3. 生成 sparse prompt 时优先保留近景稳定点，再对远处空白区域补点。
+4. 对输入给 DepthSensor GS 的 prompt 做压缩，避免远景数值过大破坏近景结构。
+5. 在 GS 阶段允许使用更大的采样深度上限，并对远景点的尺度做控制。
 
+这样做的原因是：直接把所有远景深度点喂给模型会让网络把远处区域拉伸或变成大片平面；完全不喂远景点又会导致远处没有点、变成纸板。本版本保留近景精度，同时让远景以受控方式进入第二阶段。
 
-## ✨ What can InfiniDepth do?
-InfiniDepth supports three practical capabilities for single-image 3D perception and reconstruction:
+## 推荐入口
 
-| Capability | Input | Output |
+推荐使用：
+
+```bash
+python run_final.py INPUT_IMAGE [OUTPUT_NAME]
+```
+
+`run_final.py` 会完成四步：
+
+1. 恢复最终测试过的 nice/V29 基线代码快照。
+2. 运行第一遍 InfiniDepth dense depth。
+3. 根据 dense depth 生成近景优先、远景补全的 sparse prompt。
+4. 调用 DepthSensor GS 生成最终 `.ply` 和可选视频。
+
+不推荐直接运行旧的 `.sh` 脚本，因为本版本已经把最终参数和流程整理进了 Python 入口。
+
+## 环境准备
+
+建议在 Linux 服务器上运行。示例使用默认运行目录 `/tmp/infinidepth`：
+
+```bash
+git clone https://github.com/Square-13/infinidepth_1.git
+cd infinidepth_1
+
+python3 -m venv /tmp/infinidepth/venv
+/tmp/infinidepth/venv/bin/pip install --upgrade pip
+/tmp/infinidepth/venv/bin/pip install -r requirements.txt
+```
+
+如果你已有自己的虚拟环境，可以运行时指定：
+
+```bash
+python run_final.py example_data/image/mount.png --venv /path/to/your/venv
+```
+
+## 权重放置
+
+权重文件不在仓库里，需要单独下载。默认情况下，`run_final.py` 会读取以下路径：
+
+```text
+/tmp/infinidepth/checkpoints/infinidepth.ckpt
+/tmp/infinidepth/checkpoints/moge/model.pt
+checkpoints/depth/infinidepth_depthsensor.ckpt
+checkpoints/gs/infinidepth_depthsensor_gs.ckpt
+checkpoints/sky/skyseg.onnx
+```
+
+需要手动创建目录：
+
+```bash
+mkdir -p /tmp/infinidepth/checkpoints/moge
+mkdir -p checkpoints/depth checkpoints/gs checkpoints/sky
+```
+
+权重来源：
+
+| 用途 | 文件名 | 放置位置 |
 | --- | --- | --- |
-| Monocular & Arbitrary-Resolution Depth Estimation | RGB Image | Arbitrary-Resolution Depth Map |
-| Monocular View Synthesis | RGB Image | 3D Gaussian Splatting (3DGS) |
-| Depth Sensor Augmentation (Monocular Metric Depth Estimation) | RGB Image + Depth Sensor | Metric Depth + 3D Gaussian Splatting (3DGS) |
+| 第一遍 RGB 深度估计 | `infinidepth.ckpt` | `/tmp/infinidepth/checkpoints/infinidepth.ckpt` |
+| MoGe 尺度恢复 | `model.pt` | `/tmp/infinidepth/checkpoints/moge/model.pt` |
+| DepthSensor 深度模型 | `infinidepth_depthsensor.ckpt` | `checkpoints/depth/infinidepth_depthsensor.ckpt` |
+| DepthSensor GS 模型 | `infinidepth_depthsensor_gs.ckpt` | `checkpoints/gs/infinidepth_depthsensor_gs.ckpt` |
+| 天空分割，可选但推荐 | `skyseg.onnx` | `checkpoints/sky/skyseg.onnx` |
 
-## ⚙️ Installation
-
-Please see [INSTALL.md](INSTALL.md) for manual installation.
- 
-## 🤗 Hugging Face Space Demo
-
-If you want to test InfiniDepth before running local CLI inference, start with the hosted demo:
-
-- Hugging Face Space: https://huggingface.co/spaces/ritianyu/InfiniDepth
-
-This repo also includes a Gradio Space entrypoint at `app.py`:
-
-- Input: RGB image (required), depth map (optional)
-- Task Switch: `Depth` / `3DGS`
-- Model Switch: `InfiniDepth` / `InfiniDepth_DepthSensor`
-
-### Local run
+如果不想使用 `/tmp/infinidepth`，可以用 `--tmp-root` 修改运行目录：
 
 ```bash
-python app.py
+python run_final.py example_data/image/mount.png --tmp-root /your/runtime/root
 ```
 
-### Notes
+此时第一遍深度模型和 MoGe 需要放到：
 
-- In this demo, `InfiniDepth_DepthSensor` requires a depth map input; RGB-only inference should use `InfiniDepth`.
-- Supported depth formats in the demo upload: `.png`, `.npy`, `.npz`, `.h5`, `.hdf5`, `.exr`.
+```text
+/your/runtime/root/checkpoints/infinidepth.ckpt
+/your/runtime/root/checkpoints/moge/model.pt
+```
 
+## 运行命令
 
-## 🚀 Inference
-
-### Quick Command Index
-
-| If you want ... | Recommended command |
-| --- | --- |
-| Relative Depth from Single RGB Image | `bash example_scripts/infer_depth/courtyard_infinidepth.sh` |
-| 3D Gaussian from Single RGB Image | `bash example_scripts/infer_gs/courtyard_infinidepth_gs.sh` |
-| Metric Depth from RGB + Depth Sensor | `bash example_scripts/infer_depth/eth3d_infinidepth_depthsensor.sh` |
-| 3D Gaussian from RGB + Depth Sensor | `bash example_scripts/infer_gs/eth3d_infinidepth_depthsensor_gs.sh` |
-| Multi-View / Video Depth + Global Point Cloud | `bash example_scripts/infer_depth/waymo_multi_view_infinidepth.sh` | 
-
-<details>
-<summary><strong> 1. Relative Depth from Single RGB Image</strong> (<code>inference_depth.py</code>)</summary>
-
-Use this when you want a relative depth map from a single RGB image and, optionally, a point cloud export.
-
-**Required input**
-
-- `RGB image`
-
-**Required checkpoints**
-
-- `checkpoints/depth/infinidepth.ckpt`
-- `checkpoints/moge-2-vitl-normal/model.pt` recover metric scale for point cloud export
-
-**Optional checkpoint**
-
-- `checkpoints/sky/skyseg.onnx` additional sky filtering
-
-**Recommended command**
+陌生图片优先使用默认命令。默认是 `smart` 策略，会先探测场景深度，再决定是否启用远景处理。
 
 ```bash
-python inference_depth.py \
-  --input_image_path=example_data/image/courtyard.jpg \
-  --model_type=InfiniDepth \
-  --depth_model_path=checkpoints/depth/infinidepth.ckpt \
-  --output_resolution_mode=upsample \
-  --upsample_ratio=2
+python run_final.py example_data/image/mount.png
 ```
 
-Replace `example_data/image/courtyard.jpg` with your own image path.
+也可以显式指定 profile。
 
-**For the example above, outputs are written to**
-
-- `example_data/pred_depth/` for the colorized depth map
-- `example_data/pred_pcd/` for the exported point cloud when `--save_pcd=True`
-
-**Example scripts**
+普通近中景，例如 campus：
 
 ```bash
-bash example_scripts/infer_depth/courtyard_infinidepth.sh
-bash example_scripts/infer_depth/camera_infinidepth.sh
-bash example_scripts/infer_depth/eth3d_infinidepth.sh
-bash example_scripts/infer_depth/waymo_infinidepth.sh
+python run_final.py example_data/image/campus.jpg campus --profile auto
 ```
 
-**Most useful options**
-
-| Argument | What it controls |
-| --- | --- |
-| `--output_resolution_mode` | Choose `upsample`, `original`, or `specific`. |
-| `--upsample_ratio` | Used when `output_resolution_mode=upsample`. |
-| `--output_size` | Explicit output size `(H,W)` when `output_resolution_mode=specific`. |
-| `--save_pcd` | Export a point cloud alongside the depth map. |
-| `--fx_org --fy_org --cx_org --cy_org` | Camera intrinsics in the original image resolution. |
-
-</details>
-
-<details>
-<summary><strong>2. 3D Gaussian + Novel-View Video from Single RGB Image</strong> (<code>inference_gs.py</code>)</summary>
-
-Use this when you want a 3D Gaussian export from a single RGB image and an optional novel-view video.
-
-**Required input**
-
-- `RGB image`
-
-**Required checkpoints**
-
-- `checkpoints/depth/infinidepth.ckpt`
-- `checkpoints/gs/infinidepth_gs.ckpt`
-- `checkpoints/moge-2-vitl-normal/model.pt` recover metric scale for 3D Gaussian export
-
-**Optional checkpoint**
-
-- `checkpoints/sky/skyseg.onnx` additional sky filtering
-
-**Recommended command**
+远景或山体场景，例如 mount、vally：
 
 ```bash
-python inference_gs.py \
-  --input_image_path=example_data/image/courtyard.jpg \
-  --model_type=InfiniDepth \
-  --depth_model_path=checkpoints/depth/infinidepth.ckpt \
-  --gs_model_path=checkpoints/gs/infinidepth_gs.ckpt
+python run_final.py example_data/image/mount.png mount --profile final --far-cap 2000
+python run_final.py example_data/image/vally.png vally --profile final --far-cap 2000
 ```
 
-Replace `example_data/image/courtyard.jpg` with your own image path.
-
-**For the example above, outputs are written to**
-
-- `example_data/pred_gs/InfiniDepth_courtyard_gaussians.ply`
-- `example_data/pred_gs/InfiniDepth_courtyard_novel_orbit.mp4`
-
-If `--render_size` is omitted, the novel-view video is rendered at the original input image resolution.
-
-**Example scripts**
+其他示例图：
 
 ```bash
-bash example_scripts/infer_gs/courtyard_infinidepth_gs.sh
-bash example_scripts/infer_gs/camera_infinidepth_gs.sh
-bash example_scripts/infer_gs/fruit_infinidepth_gs.sh
-bash example_scripts/infer_gs/eth3d_infinidepth_gs.sh
+python run_final.py example_data/image/ice.png ice --profile auto
+python run_final.py example_data/image/runway.jpg runway
+python run_final.py example_data/image/bird.png bird
 ```
 
-**Most useful options**
-
-| Argument | What it controls |
-| --- | --- |
-| `--render_novel_video` | Turn novel-view rendering on or off. |
-| `--render_size` | Output video resolution `(H,W)`. |
-| `--novel_trajectory` | Camera motion type: `orbit` or `swing`. |
-| `--sample_point_num` | Number of sampled points used for gaussian construction. |
-| `--enable_skyseg_model` | Enable sky masking before gaussian sampling. |
-| `--sample_sky_mask_dilate_px` | Dilate the sky mask before filtering. |
-
-> The exported `.ply` files can be visualized in 3D viewers such as [SuperSplat](https://superspl.at/).
-
-</details>
-
-<details>
-<summary><strong>3. Depth Sensor Augmentation (Metric Depth and 3D Gaussian from RGB + Depth Sensor)</strong></summary>
-
-Use this mode when you have an RGB image plus metric depth from a depth sensor.
-
-**Required inputs**
-
-- `RGB image`
-- `Sparse depth` in `.png`, `.npy`, `.npz`, `.h5`, `.hdf5`, or `.exr`
-
-**Required checkpoints**
-
-- `checkpoints/depth/infinidepth_depthsensor.ckpt`
-- `checkpoints/moge-2-vitl-normal/model.pt`
-- `checkpoints/gs/infinidepth_depthsensor_gs.ckpt`
-
-**Required flags**
-
-- `--model_type=InfiniDepth_DepthSensor`
-- `--input_depth_path=...`
-
-
-**Metric Depth Inference Command**
+如果只想生成 `.ply`，不生成视频：
 
 ```bash
-python inference_depth.py \
-  --input_image_path=example_data/image/eth3d_office.png \
-  --input_depth_path=example_data/depth/eth3d_office.npz \
-  --model_type=InfiniDepth_DepthSensor \
-  --depth_model_path=checkpoints/depth/infinidepth_depthsensor.ckpt \
-  --fx_org=866.39 \
-  --fy_org=866.04 \
-  --cx_org=791.5 \
-  --cy_org=523.81 \
-  --output_resolution_mode=upsample \
-  --upsample_ratio=1
+python run_final.py example_data/image/mount.png mount --profile final --far-cap 2000 --no-render-video
 ```
 
-**3D Gaussian Inference Command**
+运行前检查参数，不真正执行：
 
 ```bash
-python inference_gs.py \
-  --input_image_path=example_data/image/eth3d_office.png \
-  --input_depth_path=example_data/depth/eth3d_office.npz \
-  --model_type=InfiniDepth_DepthSensor \
-  --depth_model_path=checkpoints/depth/infinidepth_depthsensor.ckpt \
-  --gs_model_path=checkpoints/gs/infinidepth_depthsensor_gs.ckpt \
-  --fx_org=866.39 \
-  --fy_org=866.04 \
-  --cx_org=791.5 \
-  --cy_org=523.81
+python run_final.py example_data/image/mount.png mount --profile final --far-cap 2000 --dry-run
 ```
 
-**Example scripts**
+## profile 说明
 
-```bash
-bash example_scripts/infer_depth/eth3d_infinidepth_depthsensor.sh
-bash example_scripts/infer_depth/waymo_infinidepth_depthsensor.sh
-bash example_scripts/infer_gs/eth3d_infinidepth_depthsensor_gs.sh
-bash example_scripts/infer_gs/waymo_infinidepth_depthsensor_gs.sh
-```
-
-**Most useful options**
-
-| Argument | What it controls |
-| --- | --- |
-| `--fx_org --fy_org --cx_org --cy_org` | Strongly recommended when you know the sensor intrinsics. |
-| `--output_resolution_mode` | Output behavior for `inference_depth.py`. |
-| `--render_size` | Video resolution for `inference_gs.py`. |
-| `--output_ply_dir` | Custom output directory for gaussian export. |
-
-</details>
-
-<details>
-<summary><strong>4. Multi-View / Video Depth + Global Point Cloud</strong> (<code>inference_multi_view_depth.py</code>)</summary>
-
-Use this when you want sequence-level depth inference from an RGB image folder or video, plus per-frame aligned point clouds and one merged global point cloud. By default the script runs DA3 once on the whole sequence, then aligns each InfiniDepth depth map to the corresponding DA3 depth map before export. When you already know the camera intrinsics and extrinsics, you can instead provide them directly and skip DA3 entirely.
-
-**Required inputs**
-
-- `RGB image directory`, `single RGB image`, or `video`
-- `Sparse depth` directory / single file / depth video when `--model_type=InfiniDepth_DepthSensor`
-
-**Required checkpoints / dependencies**
-
-- `checkpoints/depth/infinidepth.ckpt` for RGB-only inference
-- `checkpoints/depth/infinidepth_depthsensor.ckpt` for RGB + depth sensor inference
-- `checkpoints/moge-2-vitl-normal/model.pt` recover metric scale for RGB-only frame inference
-- `depth-anything-3` installed in the current environment when using the default DA3-based sequence mode; default DA3 model is `depth-anything/DA3-LARGE-1.1`
-
-**Optional checkpoint**
-
-- `checkpoints/sky/skyseg.onnx` additional sky filtering
-
-**RGB-Only Multi-View / Video Command**
-
-```bash
-python inference_multi_view_depth.py \
-  --input_path=example_data/multi-view/waymo/image \
-  --model_type=InfiniDepth \
-  --depth_model_path=checkpoints/depth/infinidepth.ckpt \
-```
-
-**RGB + Depth Sensor Multi-View / Video Command**
-
-```bash
-python inference_multi_view_depth.py \
-  --input_path=example_data/multi-view/waymo/image \
-  --input_depth_path=example_data/multi-view/waymo/depth \
-  --model_type=InfiniDepth_DepthSensor \
-  --depth_model_path=checkpoints/depth/infinidepth_depthsensor.ckpt \
-```
-
-For video input, replace `--input_path` with a video file. When `--model_type=InfiniDepth_DepthSensor`, `--input_depth_path` can also be a depth video and must contain the same number of frames as the RGB input.
-
-**Explicit Camera-Parameter Multi-View Command**
-
-```bash
-python inference_multi_view_depth.py \
-  --input_path=example_data/multi-view/waymo/image \
-  --camera_intrinsics_dir=/path/to/intrinsics \
-  --camera_extrinsics_dir=/path/to/extrinsics \
-  --model_type=InfiniDepth \
-  --depth_model_path=checkpoints/depth/infinidepth.ckpt \
-```
-
-The explicit camera mode expects Waymo-style text files under `intrinsics/` and `extrinsics/`. Files are sorted lexicographically and matched one-to-one against the sorted RGB image list, so the number of camera files must exactly match the number of images. In this mode the script skips DA3 loading, DA3 cache export, DA3 RANSAC conditioning, and DA3 post scale alignment. This mode currently supports image inputs only, not video.
-
-**For the RGB-only example above, outputs are written to**
-
-- `example_data/multi-view/waymo/pred_sequence/image/frames/depth/` for aligned raw depth maps
-- `example_data/multi-view/waymo/pred_sequence/image/frames/depth_vis/` for colorized depth maps
-- `example_data/multi-view/waymo/pred_sequence/image/frames/pcd/` for per-frame aligned point clouds
-- `example_data/multi-view/waymo/pred_sequence/image/frames/meta/` for per-frame camera and alignment metadata
-- `example_data/multi-view/waymo/pred_sequence/image/da3/sequence_pose.npz` for cached DA3 predictions
-- `example_data/multi-view/waymo/pred_sequence/image/merged/sequence_merged.ply` for the merged global point cloud
-
-**Example scripts**
-
-```bash
-bash example_scripts/infer_depth/waymo_multi_view_infinidepth.sh
-bash example_scripts/infer_depth/waymo_multi_view_infinidepth_depthsensor.sh
-bash example_scripts/infer_depth/waymo_multi_view_infinidepth_explicit_camera.sh
-```
-
-**Most useful options**
-
-| Argument | What it controls |
-| --- | --- |
-| `--input_path` | RGB image directory, single image, or video path. |
-| `--input_depth_path` | Depth directory, single depth file, or depth video; required for `InfiniDepth_DepthSensor`. |
-| `--camera_intrinsics_dir --camera_extrinsics_dir` | Enable explicit camera mode from sorted Waymo-style txt directories. Image inputs only; file counts must match the RGB frame count. |
-| `--input_mode` | Force `images` or `video` instead of auto detection. |
-| `--align_to_da3_depth` | Align each InfiniDepth depth map to the corresponding DA3 depth map before export. Ignored in explicit camera mode. |
-| `--save_frame_pcd` | Save one aligned point cloud per frame. |
-| `--save_merged_pcd` | Save the merged global point cloud across the whole sequence. |
-| `--da3_scale_align_conf_threshold` | Minimum DA3 confidence used during per-frame scale estimation. |
-| `--output_root` | Override the default `pred_sequence/<sequence_name>/` output directory. |
-
-</details>
-
-<details>
-<summary><strong>5. Common Argument Conventions</strong></summary>
-
-| Argument | Used in | Description |
+| profile | 适合场景 | 说明 |
 | --- | --- | --- |
-| `--input_image_path` | depth + gs | Path to the input RGB image. |
-| `--input_path` | multi-view | Path to an RGB image directory, single image, or video. |
-| `--input_depth_path` | depth + gs + multi-view | Optional metric depth prompt; required for `InfiniDepth_DepthSensor`. In multi-view mode this can be a depth directory, single depth file, or depth video. |
-| `--camera_intrinsics_dir --camera_extrinsics_dir` | multi-view | Optional sequence camera parameter directories. When both are set, multi-view inference skips DA3 and uses the provided sorted txt files directly. |
-| `--model_type` | depth + gs + multi-view | `InfiniDepth` for RGB-only, `InfiniDepth_DepthSensor` for RGB + sparse depth. |
-| `--depth_model_path` | depth + gs | Path to the depth checkpoint. |
-| `--gs_model_path` | gs only | Path to the gaussian predictor checkpoint. |
-| `--moge2_pretrained` | depth + gs | MoGe-2 checkpoint used when `--input_depth_path` is missing. |
-| `--fx_org --fy_org --cx_org --cy_org` | depth + gs | Camera intrinsics in original image resolution. Missing values fall back to MoGe-2 estimates or image-size defaults. |
-| `--input_size` | depth + gs | Network input size `(H,W)` used during inference. |
-| `--enable_skyseg_model` | depth + gs + multi-view | Enable sky masking before depth or gaussian sampling. |
-| `--sky_model_ckpt_path` | depth + gs | Path to the sky segmentation ONNX checkpoint. |
+| `smart` | 陌生图片 | 默认策略，先用较大深度上限探测，再决定走普通场景还是远景场景。 |
+| `auto` | campus 这类普通近中景 | 更接近原来 `AUTO_SCENE=1` 的行为，避免短距离场景被过大的远景上限拉伸。 |
+| `final` | mount、vally 这类极远景 | 使用最终测试稳定的远景策略，默认允许到 2000 左右的深度范围。 |
 
-**Depth output modes**
+经验规则：
 
-- `--output_resolution_mode=upsample`: output size = `input_size * upsample_ratio`
-- `--output_resolution_mode=original`: output size = original input image size
-- `--output_resolution_mode=specific`: output size = `output_size`
+- 如果场景普通，远处不超过几百，先用 `--profile auto`。
+- 如果画面里有山、远处大背景、远景明显超过 1000，用 `--profile final --far-cap 2000`。
+- 如果不确定，用默认 `smart`。
 
-**Default output directories**
+## 输出文件
 
-| Script | Default directory |
+默认输出在 `/tmp/infinidepth/outputs/` 下：
+
+```text
+/tmp/infinidepth/outputs/self_prompt_<name>_nice_prompt_compress/
+/tmp/infinidepth/outputs/gs_<name>_nice_prompt_compress/
+```
+
+常用结果：
+
+| 文件 | 含义 |
 | --- | --- |
-| `inference_depth.py` depth images | `pred_depth/` next to your input data folder |
-| `inference_depth.py` point clouds | `pred_pcd/` next to your input data folder |
-| `inference_gs.py` gaussians and videos | `pred_gs/` next to your input data folder |
-| `inference_multi_view_depth.py` sequence outputs | `pred_sequence/<sequence_name>/` next to your input data folder |
+| `<name>_dense_vis.png` | 第一遍 dense depth 可视化 |
+| `<name>_dense_prompt_compressed_vis.png` | prompt 压缩后的深度可视化 |
+| `<name>_final_sparse_preview.png` | 最终 sparse prompt 点分布 |
+| `<name>_nice_prompt_compress_sparse.npy` | 输入给 DepthSensor GS 的 sparse depth |
+| `<name>_nice_prompt_compress.ply` | 最终 3DGS 点云/高斯结果 |
+| `<name>_nice_prompt_compress_novel.mp4` | 可选的 orbit 视频 |
 
-</details>
+脚本结束时会自动打印 Windows PowerShell 的 `scp` 下载命令。也可以手动下载，例如：
 
-## 🏋️ Training and Validation
-
-The repo also provides `main.py` training and validation entrypoints for InfiniDepth and InfiniDepth_DepthSensor.
-
-First, prepare the training/validation data and the pretrained weight as described in [DATA.md](DATA.md).
-
-Before running any command, export the environment variables required by `main.py`:
-
-```bash
-export workspace=/path/to/your/experiments
-export commonspace=/path/to/your/common_space
+```powershell
+scp server:/tmp/infinidepth/outputs/gs_mount_nice_prompt_compress/mount_nice_prompt_compress.ply "$env:USERPROFILE\Desktop\mount_nice_prompt_compress.ply"
 ```
 
-- `workspace` stores experiment outputs under `outputs/<task>/<exp_name>/`
-- `commonspace` stores datasets and pretrained weights shared across experiments
+其中 `server` 换成你的 SSH 主机名。
 
+## 算法思想
 
-### Quick Command Index
+### 1. 深度估计阶段
 
-| If you want ... | Recommended command |
+官方模型本质上是先由 encoder 提取图像特征，再由 decoder 输出深度。这里的 encoder 可以理解为“看图并提取多尺度语义和几何线索”的部分，decoder 是“根据这些特征恢复每个像素深度”的部分。
+
+本版本没有重新训练 encoder 或 decoder，而是在推理阶段调整深度上限：
+
+- `INFINIDEPTH_MAX_DEPTH` 控制第一遍深度估计的最大范围。
+- `INFINIDEPTH_MAX_PROMPT_DEPTH` 控制 sparse prompt 被模型接收的最大范围。
+- `--far-cap` 控制当前场景允许的远景上限。
+
+这样可以让远处区域先被 dense depth 估计出来，而不是一开始就被距离上限过滤掉。
+
+### 2. sparse prompt 生成阶段
+
+sparse prompt 指输入给 DepthSensor 分支的稀疏深度提示。它不是把整张 dense depth 全部喂进去，而是选择一部分点作为约束。
+
+本版本采用近景优先策略：
+
+- 近景和中景保留更多稳定点，保证主体和边缘不被破坏。
+- 远景只在原来没有点的区域补充点，避免远景点覆盖近景结构。
+- 对远景 prompt 做深度压缩，例如把过大的远景距离压到更温和的范围。
+
+这样做的目的是让模型知道“远处确实有东西”，但不要让巨大深度值直接支配第二阶段。
+
+### 3. GS 点生成阶段
+
+GS 是 Gaussian Splatting 的缩写，这里指最终生成 3D Gaussian 点。原流程容易在远景处点数不足，或者 mesh/sample pruning 把远处过滤掉。
+
+本版本做了几类修改：
+
+- 放开 GS 的最大采样深度，使远处点可以进入生成阶段。
+- 对远景 Gaussian 尺度做控制，避免远处点过大造成糊成一片。
+- 记录中间 trace 图，方便判断是 dense depth、sparse prompt 还是 GS 采样出了问题。
+
+最终效果是：近景仍然保持原来的精度，远处不再简单变成一张空白纸板。
+
+## 主要修改文件
+
+| 文件 | 作用 |
 | --- | --- |
-| Fine-tune from an existing checkpoint | Add `ckpt_path=...` to the training command |
-| Train from scratch | Omit `ckpt_path` and use a fresh `exp_name` |
-| Validate on the mixed real-data benchmark | Run `main.py` with `--entry val` |
+| `run_final.py` | 最终统一入口，替代原来的长 `.sh` 脚本。 |
+| `inference_gs.py` | 增加远景深度控制、trace 输出、GS 阶段远景处理参数。 |
+| `InfiniDepth/model/model.py` | 让最大深度和 GS 采样上限可配置。 |
+| `InfiniDepth/utils/io_utils.py` | sparse depth prompt 支持更灵活的最大深度。 |
+| `InfiniDepth/utils/sampling_utils.py` | 修改 GS 采样和远景 pruning 策略。 |
+| `InfiniDepth/utils/gs_utils.py` | 增加远景 Gaussian 尺度控制。 |
+| `InfiniDepth/utils/inference_utils.py` | 调整推理阶段过滤相关工具。 |
+| `code_snapshots/nice_latest/` | 保存最终验证过的基线代码快照，`run_final.py` 默认会恢复它。 |
 
-<details>
-<summary><strong>1. Fine-Tuning from an Existing Checkpoint</strong> (<code>main.py</code>, default <code>train_net</code> entry)</summary>
-
-Use this when you want to initialize training from an existing InfiniDepth checkpoint. The training config referenced below uses Hypersim as the training set and runs validation on a mixed real-data benchmark at the end of each epoch.
-
-**Required environment**
-
-- `workspace=/path/to/your/experiments`
-- `commonspace=/path/to/your/common_space`
-
-**RGB-Only Fine-Tuning Command**
+如果你正在开发这些文件，不希望 `run_final.py` 覆盖当前源码，可以加：
 
 ```bash
-python3 main.py \
-  --cfg_file training/exp_configs/exps/infinidepth.yaml \
-  --include training/exp_configs/components/data/train/infinidepth_train_hypersim.yaml \
-  ckpt_path=checkpoints/depth/infinidepth.ckpt \
-  exp_name=finetune_infinidepth_on_hypersim \
-  model.compute_abs_metric=True \
-  model.save_orig_pred=True \
-  model.save_metrics=True \
-  pl_trainer.devices=8
+python run_final.py example_data/image/mount.png --no-restore
 ```
 
-**RGB + Depth Sensor Fine-Tuning Command**
+## 常见问题
+
+### 1. 报错 `ModuleNotFoundError`
+
+通常是没有进入正确环境，或者 `--venv` 指错了。检查：
 
 ```bash
-python3 main.py \
-  --cfg_file training/exp_configs/exps/infinidepth_depthsensor.yaml \
-  --include training/exp_configs/components/data/train/infinidepth_train_hypersim.yaml \
-  ckpt_path=checkpoints/depth/infinidepth_depthsensor.ckpt \
-  exp_name=finetune_infinidepth_depthsensor_on_hypersim \
-  model.compute_abs_metric=True \
-  model.save_orig_pred=True \
-  model.save_metrics=True \
-  pl_trainer.devices=8
+/tmp/infinidepth/venv/bin/python3 - <<'PY'
+for m in ["h5py", "jaxtyping", "cv2", "open3d", "sklearn", "torch"]:
+    try:
+        __import__(m)
+        print(m, "ok")
+    except Exception as e:
+        print(m, "missing:", e)
+PY
 ```
 
-**Equivalent launch scripts**
+### 2. 报错找不到 checkpoint
+
+检查权重是否放到了 README 上面的默认路径。尤其注意：第一遍 RGB 深度模型默认在 `/tmp/infinidepth/checkpoints/infinidepth.ckpt`，而 DepthSensor GS 权重默认在仓库的 `checkpoints/` 目录下。
+
+### 3. 近景被拉伸
+
+一般是远景上限设置太大。短距离图片不要直接用 `--far-cap 2000`，优先：
 
 ```bash
-bash launch_scripts/train/infinidepth.sh
-bash launch_scripts/train/infinidepth_depthsensor.sh
+python run_final.py example_data/image/campus.jpg campus --profile auto
 ```
 
-**Outputs**
+### 4. 远景还是像纸板
 
-- `${workspace}/outputs/${task}/${exp_name}/checkpoints/` for saved checkpoints
-- `${workspace}/outputs/${task}/${exp_name}/tb/` for TensorBoard logs
+先看中间文件：
 
-**Notes**
-
-- `ckpt_path` must point to an existing checkpoint.
-- The training data config is `training/exp_configs/components/data/train/infinidepth_train_hypersim.yaml`.
-- If the same `exp_name` already has checkpoints in `${workspace}/outputs/${task}/${exp_name}/checkpoints/`, training will resume from the latest saved checkpoint in that directory.
-
-</details>
-
-<details>
-<summary><strong>2. Train from Scratch</strong> (<code>main.py</code>, no <code>ckpt_path</code>)</summary>
-
-Use this when you want to start training without loading an InfiniDepth `.ckpt`. In this mode, do not pass `ckpt_path`. The model will still load the DINOv3 backbone from `${commonspace}/pretrained_models/dinov3/`. You need to download the DINOv3 weights yourself and place them there before running.
-
-**RGB-Only Training-from-Scratch Command**
-
-```bash
-python3 main.py \
-  --cfg_file training/exp_configs/exps/infinidepth.yaml \
-  --include training/exp_configs/components/data/train/infinidepth_train_hypersim.yaml \
-  exp_name=train_infinidepth_from_scratch \
-  model.compute_abs_metric=True \
-  model.save_orig_pred=True \
-  model.save_metrics=True \
-  pl_trainer.devices=2
+```text
+<name>_dense_vis.png
+<name>_final_sparse_preview.png
+<name>_stage2_refined_dense_depth.png
 ```
 
-**RGB + Depth Sensor Training-from-Scratch Command**
+如果 dense depth 本身已经有远景，但 final sparse preview 远景点少，说明 sparse prompt 还需要增加远景补点；如果 sparse prompt 有点但最终仍然糊，说明 GS 采样点数或远景尺度需要继续调。
 
-```bash
-python3 main.py \
-  --cfg_file training/exp_configs/exps/infinidepth_depthsensor.yaml \
-  --include training/exp_configs/components/data/train/infinidepth_train_hypersim.yaml \
-  exp_name=train_infinidepth_depthsensor_from_scratch \
-  model.compute_abs_metric=True \
-  model.save_orig_pred=True \
-  model.save_metrics=True \
-  pl_trainer.devices=2
-```
+## 说明
 
-**Notes**
+本仓库是在官方 InfiniDepth 基础上的推理阶段改造版本。训练代码保留官方结构，方便完整运行和对照，但本版本的主要贡献集中在 `run_final.py` 和远景 GS 推理相关代码上。
 
-- Use a new `exp_name` for a clean scratch run.
-- If you intentionally want to reuse an old `exp_name`, set `resume_training=False` to prevent automatic resume. Be careful: when `resume_training=False`, the code will delete the old output directory before training.
-
-</details>
-
-<details>
-<summary><strong>3. Validation from a Checkpoint</strong> (<code>main.py</code> with <code>--entry val</code>)</summary>
-
-Use this when you want to run validation metrics on the mixed real-data benchmark defined in `training/exp_configs/components/data/test/infinidepth_mix_data.yaml`.
-
-**RGB-Only Validation Command**
-
-```bash
-python3 main.py \
-  --cfg_file training/exp_configs/exps/infinidepth.yaml \
-  --include training/exp_configs/components/data/test/infinidepth_mix_data.yaml \
-  --entry val \
-  ckpt_path=checkpoints/depth/infinidepth.ckpt \
-  exp_name=eval_infinidepth \
-  model.compute_abs_metric=True \
-  model.save_orig_pred=True \
-  model.save_metrics=True \
-  pl_trainer.devices=2
-```
-
-**RGB + Depth Sensor Validation Command**
-
-```bash
-python3 main.py \
-  --cfg_file training/exp_configs/exps/infinidepth_depthsensor.yaml \
-  --include training/exp_configs/components/data/test/infinidepth_mix_data.yaml \
-  --entry val \
-  ckpt_path=checkpoints/depth/infinidepth_depthsensor.ckpt \
-  exp_name=eval_infinidepth_depthsensor \
-  model.compute_abs_metric=True \
-  model.save_orig_pred=True \
-  model.save_metrics=True \
-  pl_trainer.devices=2
-```
-
-**Reference launch scripts**
-
-```bash
-bash launch_scripts/eval/infinidepth.sh
-bash launch_scripts/eval/infinidepth_depthsensor.sh
-```
-
-**Validation datasets**
-
-- Kitti val split
-- ETH3D val split
-- NYU val split
-- ScanNet val split
-- DIODE indoor val split
-- Synth4K (CyberPunk, DeadIsland, SpiderMan2, SpiderManMM, WatchDogLegion)
-
-These datasets are read from `${commonspace}/datasets/` using the meta files referenced in `training/exp_configs/components/data/test/infinidepth_mix_data.yaml`.
-
-**Outputs**
-
-- `${workspace}/outputs/${task}/${exp_name}/val_metrics/` for validation logs
-- `${workspace}/outputs/${task}/${exp_name}/default/metrics/metrics.json` for aggregated validation metrics
-- `${workspace}/outputs/${task}/${exp_name}/default/metrics/all_scenes.csv` when `model.save_metrics=True`
-
-</details>
-
-<details>
-<summary><strong>4. Common Overrides</strong></summary>
-
-| Argument | What it controls |
-| --- | --- |
-| `ckpt_path` | Initialization or evaluation checkpoint path. Omit it for training from scratch. |
-| `exp_name` | Experiment name used to build `${workspace}/outputs/${task}/${exp_name}`. |
-| `pl_trainer.devices` | Number of GPUs used by PyTorch Lightning. |
-| `model.compute_abs_metric` | Enable absolute-metric evaluation during training or validation. |
-| `model.save_orig_pred` | Save original prediction outputs alongside logs and metrics. |
-| `model.save_metrics` | Save metric files for later inspection. |
-| `--entry val` | Switch `main.py` from the default training entry to the validation entry. |
-| `--include` | Merge an extra data config, such as `training/exp_configs/components/data/test/infinidepth_mix_data.yaml`. |
-
-</details>
-
-## 🙏 Acknowledgments
-
-We thank <a href="https://yuanhongyu.xyz/" target="_blank">Yuanhong Yu</a>, <a href="https://gangweix.github.io/" target="_blank">Gangwei Xu</a>, <a href="https://github.com/ghy0324" target="_blank">Haoyu Guo</a>  and <a href="https://hugoycj.github.io/" target="_blank">Chongjie Ye</a> for their insightful discussions and valuable suggestions, and <a href="https://zhenx.me/" target="_blank">Zhen Xu</a> for his dedicated efforts in curating the synthetic data.
-
-
-## 📖 Citation
-
-If you find InfiniDepth useful in your research, please consider citing:
-
-```bibtex
-@article{yu2026infinidepth,
-    title={InfiniDepth: Arbitrary-Resolution and Fine-Grained Depth Estimation with Neural Implicit Fields},
-    author={Hao Yu, Haotong Lin, Jiawei Wang, Jiaxin Li, Yida Wang, Xueyang Zhang, Yue Wang, Xiaowei Zhou, Ruizhen Hu and Sida Peng},
-    booktitle={arXiv preprint},
-    year={2026}
-}
-```
----
-
-<div align="center">
-
-<img src="https://raw.githubusercontent.com/Tarikul-Islam-Anik/Animated-Fluent-Emojis/master/Emojis/Hand%20gestures/Folded%20Hands%20Light%20Skin%20Tone.png" alt="Thanks" width="25" height="25" />
-
-**Thank you for your interest in InfiniDepth!**
-
-<sub>⭐ Star this repo if you find it interesting!</sub>
-
-</div>
+如果需要引用原方法，请引用 InfiniDepth 官方论文和项目。
