@@ -44,6 +44,16 @@ def _make_dense_query_coord(batch: int, h: int, w: int, device: torch.device) ->
     return query.expand(batch, -1, -1).contiguous()
                       
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
 @dataclass
 class _InferenceState:
     gt_depth: Optional[torch.Tensor] = None
@@ -59,8 +69,14 @@ class _BaseInfiniDepthModel(nn.Module):
         self,
         model_path: Optional[str] = None,
         encoder: str = "vitl16",
+        max_depth: Optional[float] = None,
+        min_disparity: Optional[float] = None,
     ):
         super().__init__()
+        self.max_depth = float(max_depth or _env_float("INFINIDEPTH_MAX_DEPTH", 500.0))
+        if min_disparity is None:
+            min_disparity = _env_float("INFINIDEPTH_MIN_DISPARITY", 1.0 / max(self.max_depth, 1e-6))
+        self.min_disparity = max(float(min_disparity), 1e-8)
         self.model_config = dinov3_model_configs[encoder]
         local_dinov3_repo = _resolve_local_dinov3_repo()
         self.pretrained = torch.hub.load(
@@ -155,7 +171,7 @@ class _BaseInfiniDepthModel(nn.Module):
 
     def _to_depth_disparity(self, pred: torch.Tensor):
         pred_disparity = pred
-        pred_depth = 1.0 / torch.clamp(pred, min=5e-3)
+        pred_depth = 1.0 / torch.clamp(pred, min=self.min_disparity)
         return pred_depth, pred_disparity
 
     @torch.no_grad()
@@ -285,10 +301,22 @@ class _BaseInfiniDepthModel(nn.Module):
         sky_mask: Optional[torch.Tensor] = None,
         sample_point_num: int = 200000,
         coord_deterministic_sampling: bool = True,
+        gs_max_sample_depth: Optional[float] = None,
+        gs_sample_filter_mode: str = "max_depth",
+        gs_far_detail_min_depth: float = 45.0,
+        gs_far_detail_edge_quantile: float = 0.65,
+        gs_far_detail_area_boost: float = 8.0,
+        gs_triangle_internal_guard: bool = True,
+        gs_triangle_edge_quantile: float = 0.92,
+        gs_triangle_depth_span_ratio: float = 0.055,
+        gs_triangle_depth_span_abs: float = 4.0,
+        gs_triangle_guard_min_depth: float = 8.0,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """GS-specific inference with two steps:
         step1: 2D-uniform dense query; step2: 3D-uniform triangle query."""
         b, _, h, w = image.shape
+        if gs_max_sample_depth is None:
+            gs_max_sample_depth = self.max_depth
 
         query = _make_dense_query_coord(b, h, w, image.device)
         pred_depth, _, dino_tokens = self.inference(
@@ -313,8 +341,18 @@ class _BaseInfiniDepthModel(nn.Module):
                 cy=float(intrinsics[bi, 1, 2].item()),
                 N=sample_point_num,
                 coord_norm="minus_one_to_one",
-                sample_filter_mode="max_depth",
+                sample_filter_mode=gs_sample_filter_mode,
                 sky_mask_hw=None if sky_mask is None else sky_mask[bi],
+                max_sample_depth=gs_max_sample_depth,
+                image_hw=image[bi],
+                far_detail_min_depth=gs_far_detail_min_depth,
+                far_detail_edge_quantile=gs_far_detail_edge_quantile,
+                far_detail_area_boost=gs_far_detail_area_boost,
+                triangle_internal_guard=gs_triangle_internal_guard,
+                triangle_edge_quantile=gs_triangle_edge_quantile,
+                triangle_depth_span_ratio=gs_triangle_depth_span_ratio,
+                triangle_depth_span_abs=gs_triangle_depth_span_abs,
+                triangle_guard_min_depth=gs_triangle_guard_min_depth,
                 deterministic=coord_deterministic_sampling,
             )
             sampled_coords.append(coord_b)

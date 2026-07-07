@@ -136,6 +136,36 @@ def _faces_to_ij(faces, h, w):
     return i, j
 
 
+def _image_to_edge_hw(image_hw: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """Return a simple RGB edge magnitude map in image/depth resolution."""
+    image = image_hw
+    if image.ndim == 3 and image.shape[0] in (1, 3):
+        image = image.permute(1, 2, 0)
+    if image.ndim == 2:
+        gray = image.float()
+    elif image.ndim == 3 and image.shape[-1] >= 3:
+        rgb = image[..., :3].float()
+        gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    elif image.ndim == 3 and image.shape[-1] == 1:
+        gray = image[..., 0].float()
+    else:
+        raise ValueError(f"Unsupported image_hw shape for edge extraction: {tuple(image_hw.shape)}")
+
+    if gray.shape != (h, w):
+        gray = torch.nn.functional.interpolate(
+            gray[None, None],
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+
+    gx = torch.zeros_like(gray)
+    gy = torch.zeros_like(gray)
+    gx[:, 1:] = torch.abs(gray[:, 1:] - gray[:, :-1])
+    gy[1:, :] = torch.abs(gray[1:, :] - gray[:-1, :])
+    return gx + gy
+
+
 def make_3d_uniform_coord_triangle(
     depth_hw: torch.Tensor, 
     fx: float, 
@@ -145,9 +175,19 @@ def make_3d_uniform_coord_triangle(
     N: int, 
     coord_norm: str = "minus_one_to_one",
     sample_filter_mode: typing.Literal["none", "max_depth", "sky_mask"] = "max_depth",
-    depth_ratio: float = 1.05, 
+    depth_ratio: float = 1.035, 
     sky_mask_hw: Optional[torch.Tensor] = None,
     max_edge: Optional[float] = None,
+    max_sample_depth: float = 500.0,
+    image_hw: Optional[torch.Tensor] = None,
+    far_detail_min_depth: float = 55.0,
+    far_detail_edge_quantile: float = 0.82,
+    far_detail_area_boost: float = 6.0,
+    triangle_internal_guard: bool = True,
+    triangle_edge_quantile: float = 0.92,
+    triangle_depth_span_ratio: float = 0.055,
+    triangle_depth_span_abs: float = 4.0,
+    triangle_guard_min_depth: float = 8.0,
     max_depth_margin: float = 0.9,
     deterministic: bool = True,
 ) -> torch.Tensor:
@@ -198,7 +238,10 @@ def make_3d_uniform_coord_triangle(
         C_temp = Vflat[faces[:, 2]]
         zA, zB, zC = A_temp[:, 2], B_temp[:, 2], C_temp[:, 2]
         zmax_per_tri = torch.max(torch.max(zA, zB), zC)
-        depth_mask = zmax_per_tri < 90
+        depth_mask = zmax_per_tri < max_sample_depth
+        if sky_mask_hw is not None:
+            sky_mask_flat = sky_mask_hw.to(device=device, dtype=torch.bool).reshape(-1)
+            depth_mask &= ~(sky_mask_flat[faces].float().mean(dim=1) > 0.34)
         faces = faces[depth_mask]
     elif sample_filter_mode == "none":
         pass
@@ -218,10 +261,83 @@ def make_3d_uniform_coord_triangle(
     cross_product = torch.cross(B - A, C - A, dim=-1)
     areas = 0.5 * torch.norm(cross_product, dim=-1)
     areas = torch.clamp(areas, min=0.0)
+
+    if (
+        image_hw is not None
+        and far_detail_area_boost > 1.0
+        and 0.0 <= far_detail_edge_quantile < 1.0
+        and len(faces) > 0
+    ):
+        edge_hw = _image_to_edge_hw(image_hw.to(device=device), h, w)
+        edge_flat = edge_hw.reshape(-1)
+        edge_per_tri = edge_flat[faces].mean(dim=1)
+        zmean_per_tri = (A[:, 2] + B[:, 2] + C[:, 2]) / 3.0
+        far_tri = zmean_per_tri >= far_detail_min_depth
+
+        if sky_mask_hw is not None:
+            sky_mask_flat = sky_mask_hw.to(device=device, dtype=torch.bool).reshape(-1)
+            far_tri &= ~sky_mask_flat[faces].all(dim=1)
+
+        if far_tri.any():
+            far_edges = edge_per_tri[far_tri]
+            edge_threshold = torch.quantile(far_edges, far_detail_edge_quantile)
+            detail_tri = far_tri & (edge_per_tri >= edge_threshold)
+            if detail_tri.any():
+                boost = torch.ones_like(areas)
+                boost[detail_tri] = far_detail_area_boost
+                areas = areas * boost
+
+    guarded_faces = torch.zeros(len(faces), dtype=torch.bool, device=device)
+    triangle_vertex_choice = None
+    if triangle_internal_guard and len(faces) > 0:
+        zA, zB, zC = A[:, 2], B[:, 2], C[:, 2]
+        zmin_per_tri = torch.min(torch.min(zA, zB), zC)
+        zmax_per_tri = torch.max(torch.max(zA, zB), zC)
+        zmean_per_tri = (zA + zB + zC) / 3.0
+        zspan_per_tri = zmax_per_tri - zmin_per_tri
+
+        depth_risk = (
+            (zmean_per_tri >= triangle_guard_min_depth)
+            & (zspan_per_tri > triangle_depth_span_abs)
+            & ((zspan_per_tri / torch.clamp(zmean_per_tri, min=1.0)) > triangle_depth_span_ratio)
+        )
+
+        rgb_risk = torch.zeros_like(depth_risk)
+        if image_hw is not None and 0.0 <= triangle_edge_quantile < 1.0:
+            edge_hw = _image_to_edge_hw(image_hw.to(device=device), h, w)
+            edge_flat = edge_hw.reshape(-1)
+            face_edges = edge_flat[faces]
+            edge_per_tri = face_edges.max(dim=1).values
+            eligible = zmean_per_tri >= triangle_guard_min_depth
+            if eligible.any():
+                edge_threshold = torch.quantile(edge_per_tri[eligible], triangle_edge_quantile)
+                rgb_risk = eligible & (edge_per_tri >= edge_threshold)
+                triangle_vertex_choice = torch.argmin(face_edges, dim=1)
+
+        # RGB texture edges such as facade windows are not geometry boundaries.
+        # Use them only for diagnostics/vertex preference, not as standalone
+        # reasons to suppress triangle interiors. The actual guard is driven by
+        # depth-span inconsistency.
+        guarded_faces = depth_risk
+        if guarded_faces.any() and triangle_vertex_choice is None:
+            z_stack = torch.stack([zA, zB, zC], dim=1)
+            z_median = z_stack.median(dim=1, keepdim=True).values
+            triangle_vertex_choice = torch.argmin(torch.abs(z_stack - z_median), dim=1)
+
     total_area = areas.sum()
     if not torch.isfinite(total_area) or total_area <= 0:
         raise RuntimeError("Invalid total area; check depth values.")
     probs = areas / total_area
+    sample_areas = areas
+    if guarded_faces.any():
+        sample_areas = areas.clone()
+        sample_areas[guarded_faces] = 0.0
+        if not torch.isfinite(sample_areas.sum()) or sample_areas.sum() <= 0:
+            sample_areas = areas
+        else:
+            guarded_ratio = float(guarded_faces.float().mean().item())
+            print(f"[Info] triangle internal guard: {int(guarded_faces.sum().item())}/{len(faces)} faces guarded ({guarded_ratio:.3f})")
+    sample_probs = sample_areas / sample_areas.sum()
 
     num_faces = len(faces)
     
@@ -233,14 +349,20 @@ def make_3d_uniform_coord_triangle(
         
         i_centroids = (fi_all[:, 0] + fi_all[:, 1] + fi_all[:, 2]) / 3.0
         j_centroids = (fj_all[:, 0] + fj_all[:, 1] + fj_all[:, 2]) / 3.0
+        # Keep the one-per-face base sample at the triangle centroid. Moving
+        # guarded faces to a vertex creates systematic dents/protrusions on
+        # textured but geometrically flat facades. The guard only affects extra
+        # interior samples below.
+        face_i = i_centroids
+        face_j = j_centroids
         
         if N <= num_faces:
-            top_indices = torch.argsort(-areas)[:N]
-            i_s = i_centroids[top_indices]
-            j_s = j_centroids[top_indices]
+            top_indices = torch.argsort(-sample_areas)[:N]
+            i_s = face_i[top_indices]
+            j_s = face_j[top_indices]
         else:
-            base_i = i_centroids  # (num_faces,)
-            base_j = j_centroids  # (num_faces,)
+            base_i = face_i  # (num_faces,)
+            base_j = face_j  # (num_faces,)
             
             remaining_points = N - num_faces
             
@@ -248,7 +370,9 @@ def make_3d_uniform_coord_triangle(
                 i_s = base_i
                 j_s = base_j
             else:
-                sqrt_areas = torch.sqrt(areas)
+                sqrt_areas = torch.sqrt(sample_areas)
+                if not torch.isfinite(sqrt_areas.sum()) or sqrt_areas.sum() <= 0:
+                    sqrt_areas = torch.sqrt(areas)
                 sqrt_probs = sqrt_areas / sqrt_areas.sum()
                 
                 extra_raw = sqrt_probs * remaining_points
@@ -317,7 +441,7 @@ def make_3d_uniform_coord_triangle(
                     j_s = base_j
         
     else:
-        tri_idx = torch.multinomial(probs, num_samples=N, replacement=True)  # (N,)
+        tri_idx = torch.multinomial(sample_probs, num_samples=N, replacement=True)  # (N,)
         f = faces[tri_idx]  # (N, 3)
 
         u = torch.rand(N, device=device)
