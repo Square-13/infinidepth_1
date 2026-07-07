@@ -4,9 +4,6 @@
 # the terms of the DINOv3 License Agreement.
 
 import logging
-from pathlib import Path
-
-from typing import Union
 
 import torch
 import torch.nn as nn
@@ -85,40 +82,3 @@ def build_model_from_cfg(cfg, only_teacher: bool = False):
     else:
         student, teacher, embed_dim = outputs
         return student, teacher, embed_dim
-
-
-def build_model_for_eval(
-    config,
-    pretrained_weights: Union[str, Path] | None,
-    shard_unsharded_model: bool = False,  # If the model is not sharded, shard it. No effect if already sharded on disk
-):
-    model, _ = build_model_from_cfg(config, only_teacher=True)
-    if pretrained_weights is None or pretrained_weights == "":
-        logger.info("No pretrained weights")
-        model.init_weights()
-    elif Path(pretrained_weights).is_dir():
-        logger.info("PyTorch DCP checkpoint")
-        from dinov3.checkpointer import load_checkpoint
-        from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
-
-        moduledict = nn.ModuleDict({"backbone": model})
-        # Wrap with FSDP
-        ac_compile_parallelize(moduledict, inference_only_models=[], cfg=config)
-        # Move to CUDA
-        model.to_empty(device="cuda")
-        # Load checkpoint
-        load_checkpoint(pretrained_weights, model=moduledict, strict_loading=True)
-        shard_unsharded_model = False
-    else:
-        logger.info("PyTorch consolidated checkpoint")
-        from dinov3.checkpointer import init_model_from_checkpoint_for_evals
-
-        # consolidated checkpoint codepath
-        model.to_empty(device="cuda")
-        init_model_from_checkpoint_for_evals(model, pretrained_weights, "teacher")
-    if shard_unsharded_model:
-        logger.info("Sharding model")
-        moduledict = nn.ModuleDict({"backbone": model})
-        ac_compile_parallelize(moduledict, inference_only_models=[], cfg=config)
-    model.eval()
-    return model

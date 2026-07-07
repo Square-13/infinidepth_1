@@ -207,6 +207,81 @@ def main(args: GSInferenceArgs) -> None:
     if query_3d_uniform_coord is None or pred_depth_3d is None:
         raise RuntimeError("inference_gs did not return 3d-uniform query outputs.")
 
+    # OFFICIAL_SAFE_FAR_RELATIVE_UNCOMPRESS
+    _far_relative_map = os.environ.get("OFFICIAL_SAFE_FAR_RELATIVE_MAP", "")
+    if _far_relative_map and os.path.exists(_far_relative_map):
+        try:
+            import numpy as _fr_np
+            import torch.nn.functional as _fr_F
+            from PIL import Image as _FrImage
+            from pathlib import Path as _FrPath
+
+            _data = _fr_np.load(_far_relative_map)
+            _mask_np = _data["mask"].astype("float32")
+            if _mask_np.ndim > 2:
+                _mask_np = _mask_np.squeeze()
+            _mask_t = torch.from_numpy(_mask_np).to(device=device, dtype=depthmap.dtype).view(1, 1, *_mask_np.shape[-2:])
+            _mask_t = _fr_F.interpolate(_mask_t, size=(h, w), mode="nearest")
+            if b > 1:
+                _mask_t = _mask_t.expand(b, -1, -1, -1)
+            _alpha = _mask_t.clamp(0.0, 1.0)
+            for _ in range(2):
+                _alpha = _fr_F.avg_pool2d(_alpha, kernel_size=7, stride=1, padding=3)
+            _alpha = torch.clamp(_alpha * 1.25, 0.0, 1.0)
+
+            _raw_log_lo = float(_data["raw_log_lo"])
+            _raw_log_hi = float(_data["raw_log_hi"])
+            _prompt_min = float(_data["prompt_min"])
+            _prompt_max = float(_data["prompt_max"])
+            _prompt_span = max(_prompt_max - _prompt_min, 1e-6)
+            _raw_log_span = max(_raw_log_hi - _raw_log_lo, 1e-6)
+            _relative_gain = float(os.environ.get("OFFICIAL_SAFE_FAR_RELATIVE_GAIN", "1.0"))
+            _relative_center = float(os.environ.get("OFFICIAL_SAFE_FAR_RELATIVE_CENTER", "0.5"))
+            _relative_gain = max(0.05, min(_relative_gain, 8.0))
+            _relative_center = max(0.0, min(_relative_center, 1.0))
+
+            def _uncompress_relative(_z: torch.Tensor) -> torch.Tensor:
+                _norm = torch.clamp((_z - _prompt_min) / _prompt_span, 0.0, 1.0)
+                _norm = torch.clamp(_relative_center + (_norm - _relative_center) * _relative_gain, 0.0, 1.0)
+                _raw_log = _raw_log_lo + _norm * _raw_log_span
+                return torch.exp(_raw_log)
+
+            _uncompressed_depthmap = _uncompress_relative(depthmap)
+            depthmap = depthmap * (1.0 - _alpha) + _uncompressed_depthmap * _alpha
+
+            _grid = query_3d_uniform_coord[..., [1, 0]].view(b, 1, -1, 2)
+            _sample_alpha = _fr_F.grid_sample(_alpha, _grid, mode="bilinear", align_corners=False).view(b, -1, 1)
+            _uncompressed_pred = _uncompress_relative(pred_depth_3d)
+            pred_depth_3d = pred_depth_3d * (1.0 - _sample_alpha) + _uncompressed_pred * _sample_alpha
+
+            print(
+                "[Info] far relative prompt uncompressed:",
+                f"pixels={int((_mask_t > 0.5).sum().item())}",
+                f"query_points={int((_sample_alpha > 0.03).sum().item())}",
+                f"prompt_range={_prompt_min:.2f}-{_prompt_max:.2f}",
+                f"raw_range={float(_fr_np.exp(_raw_log_lo)):.2f}-{float(_fr_np.exp(_raw_log_hi)):.2f}",
+                f"gain={_relative_gain:.2f}",
+            )
+
+            _trace_out = os.environ.get("OFFICIAL_SAFE_TRACE_OUT")
+            if _trace_out:
+                _trace_name = os.environ.get("OFFICIAL_SAFE_TRACE_NAME", "trace")
+                _trace_dir = _FrPath(_trace_out)
+                _trace_dir.mkdir(parents=True, exist_ok=True)
+                _arr = depthmap.detach().float().cpu().numpy().squeeze()
+                _fr_np.save(_trace_dir / f"{_trace_name}_stage2_far_relative_uncompressed_depth.npy", _arr)
+                _mask_vis = (_mask_t[0, 0].detach().cpu().numpy() > 0.5).astype(_fr_np.uint8) * 255
+                _FrImage.fromarray(_mask_vis).save(_trace_dir / f"{_trace_name}_stage2_far_relative_mask.png")
+                _valid = _fr_np.isfinite(_arr) & (_arr > 0)
+                _vis = _fr_np.zeros(_arr.shape[-2:], dtype=_fr_np.uint8)
+                if _valid.any():
+                    _lo, _hi = _fr_np.percentile(_arr[_valid], [2, 98])
+                    _vis = (_fr_np.clip((_arr - _lo) / (_hi - _lo + 1e-6), 0, 1) * 255).astype(_fr_np.uint8)
+                    _vis[~_valid] = 0
+                _FrImage.fromarray(_vis).save(_trace_dir / f"{_trace_name}_stage2_far_relative_uncompressed_depth.png")
+        except Exception as _fr_exc:
+            print(f"[Warning] far relative prompt uncompress skipped: {_fr_exc}")
+
     # OFFICIAL_SAFE_FAR_COMPRESS
     _far_compress_enabled = os.environ.get("OFFICIAL_SAFE_FAR_COMPRESS_TO_GS", "0").lower() in ("1", "true", "yes", "on")
     _far_mask_path = os.environ.get("OFFICIAL_SAFE_RELIEF_MASK_PATH")
@@ -464,6 +539,80 @@ def main(args: GSInferenceArgs) -> None:
                 print(f"[Info] GS relief skipped: too few mask pixels ({_candidate_count})")
         except Exception as _rel_exc:
             print(f"[Warning] GS relief skipped: {_rel_exc}")
+
+    # OFFICIAL_SAFE_FAR_RAW_GS_OVERRIDE
+    _far_raw_depth_path = os.environ.get("OFFICIAL_SAFE_FAR_RAW_GS_DEPTH_PATH", "")
+    if _far_raw_depth_path and os.path.exists(_far_raw_depth_path):
+        try:
+            import numpy as _raw_np
+            import torch.nn.functional as _raw_F
+            from PIL import Image as _RawImage
+            from pathlib import Path as _RawPath
+
+            _raw_arr = _raw_np.load(_far_raw_depth_path).astype("float32")
+            _raw_arr = _raw_np.squeeze(_raw_arr)
+            if _raw_arr.ndim != 2:
+                raise ValueError(f"Expected 2D raw depth, got {_raw_arr.shape}")
+
+            _raw_t = torch.from_numpy(_raw_arr).to(device=device, dtype=depthmap.dtype).view(1, 1, *_raw_arr.shape)
+            if _raw_t.shape[-2:] != (h, w):
+                _raw_t = _raw_F.interpolate(_raw_t, size=(h, w), mode="bilinear", align_corners=False)
+            if b > 1:
+                _raw_t = _raw_t.expand(b, -1, -1, -1)
+
+            _raw_min = float(os.environ.get("OFFICIAL_SAFE_FAR_RAW_GS_MIN", "180"))
+            _raw_max = float(os.environ.get("OFFICIAL_SAFE_FAR_RAW_GS_MAX", "2000"))
+            _raw_blend = float(os.environ.get("OFFICIAL_SAFE_FAR_RAW_GS_BLEND", "1.0"))
+            _apply_dense = os.environ.get("OFFICIAL_SAFE_FAR_RAW_GS_APPLY_DENSE", "0").lower() in ("1", "true", "yes", "on")
+            _raw_blend = max(0.0, min(1.0, _raw_blend))
+
+            _raw_mask = torch.isfinite(_raw_t) & (_raw_t >= _raw_min) & (_raw_t <= _raw_max)
+            if sky_mask is not None:
+                _sky_t = sky_mask.to(device=device, dtype=torch.bool)
+                if _sky_t.ndim == 3:
+                    _sky_t = _sky_t[:, None]
+                elif _sky_t.ndim == 2:
+                    _sky_t = _sky_t[None, None]
+                if _sky_t.shape[-2:] != (h, w):
+                    _sky_t = _raw_F.interpolate(_sky_t.float(), size=(h, w), mode="nearest") > 0.5
+                _raw_mask &= ~_sky_t
+
+            _alpha = _raw_mask.to(dtype=depthmap.dtype) * _raw_blend
+            for _ in range(2):
+                _alpha = _raw_F.avg_pool2d(_alpha, kernel_size=5, stride=1, padding=2)
+            _alpha = torch.clamp(_alpha, 0.0, 1.0)
+
+            _grid = query_3d_uniform_coord[..., [1, 0]].view(b, 1, -1, 2)
+            _sample_alpha = _raw_F.grid_sample(_alpha, _grid, mode="bilinear", align_corners=False).view(b, -1, 1)
+            _sample_raw = _raw_F.grid_sample(_raw_t, _grid, mode="bilinear", align_corners=False).view(b, -1, 1)
+            pred_depth_3d = pred_depth_3d * (1.0 - _sample_alpha) + _sample_raw * _sample_alpha
+            if _apply_dense:
+                depthmap = depthmap * (1.0 - _alpha) + _raw_t * _alpha
+
+            print(
+                "[Info] far raw GS override:",
+                f"pixels={int(_raw_mask.sum().item())}",
+                f"query_points={int((_sample_alpha > 0.03).sum().item())}",
+                f"range={_raw_min:.1f}-{_raw_max:.1f}",
+                f"blend={_raw_blend:.2f}",
+                f"apply_dense={_apply_dense}",
+            )
+
+            _trace_out = os.environ.get("OFFICIAL_SAFE_TRACE_OUT")
+            if _trace_out:
+                _trace_name = os.environ.get("OFFICIAL_SAFE_TRACE_NAME", "trace")
+                _trace_dir = _RawPath(_trace_out)
+                _trace_dir.mkdir(parents=True, exist_ok=True)
+                _mask_vis = (_raw_mask[0, 0].detach().cpu().numpy().astype(_raw_np.uint8) * 255)
+                _RawImage.fromarray(_mask_vis).save(_trace_dir / f"{_trace_name}_stage2_far_raw_gs_mask.png")
+                _raw_np.savez_compressed(
+                    _trace_dir / f"{_trace_name}_stage2_far_raw_gs_samples.npz",
+                    alpha=_sample_alpha.detach().float().cpu().numpy(),
+                    raw_depth=_sample_raw.detach().float().cpu().numpy(),
+                    pred_depth_3d=pred_depth_3d.detach().float().cpu().numpy(),
+                )
+        except Exception as _raw_exc:
+            print(f"[Warning] far raw GS override skipped: {_raw_exc}")
 
     
     print(
