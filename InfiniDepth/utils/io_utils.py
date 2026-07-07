@@ -279,11 +279,22 @@ def read_depth_array(depth_path: str) -> np.ndarray:
     return _read_depth_array(depth_path)
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be a float, got {value!r}.") from exc
+
+
 def load_depth(depth_path: str,
                tar_size: Tuple[int, int] = (504, 672),
-               num_samples: int = 1500,
-               min_prompt: int = 1,
-               max_prompt: int = 100,
+               num_samples: int = 50000,
+               min_prompt: float = 1.0,
+               max_prompt: Optional[float] = None,
+               preserve_sparse: bool = False,
                enable_noise_filter: bool = False,
                filter_std_threshold: float = 0.8,
                filter_median_threshold: float = 0.5,
@@ -311,6 +322,12 @@ def load_depth(depth_path: str,
     '''
     depth = _read_depth_array(depth_path=depth_path)
     depth = cv2.resize(depth, tar_size[::-1], interpolation=cv2.INTER_NEAREST)
+    if max_prompt is None:
+        max_prompt = _env_float(
+            "INFINIDEPTH_MAX_PROMPT_DEPTH",
+            _env_float("INFINIDEPTH_MAX_DEPTH", 500.0),
+        )
+    max_prompt = float(max_prompt)
 
     if enable_noise_filter:
         print("\n=== Applying strict depth noise filtering ===")
@@ -333,11 +350,16 @@ def load_depth(depth_path: str,
         depth_mask = ((depth > min_prompt) & (depth < max_prompt)).astype(np.float32)
 
     # ---------- Valid Depth Prompt ----------
-    valid_depth = depth * depth_mask 
-    if (valid_depth > 0.1).sum() > num_samples:
+    valid_depth = depth * depth_mask
+    valid_count = int((valid_depth > 0.1).sum())
+
+    if preserve_sparse:
+        sample_depth = valid_depth
+        print(f"[Info] preserve_sparse=True: keeping {valid_count} prompt points")
+    elif valid_count > num_samples:
         height, width = depth.shape
         sample_depth = valid_depth.reshape(-1)
-        nonzero_index = np.array(list(np.nonzero(sample_depth>0.1))).squeeze()
+        nonzero_index = np.where(sample_depth > 0.1)[0]
         index = np.random.permutation(nonzero_index)[:num_samples]
         sample_mask = np.ones_like(sample_depth)
         sample_mask[index] = 0.
